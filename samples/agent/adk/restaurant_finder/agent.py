@@ -19,6 +19,12 @@ from collections.abc import AsyncIterable
 from typing import Any
 
 import jsonschema
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -27,13 +33,6 @@ from a2a.types import (
     Part,
     TextPart,
 )
-from google.adk.agents.llm_agent import LlmAgent
-from google.adk.artifacts import InMemoryArtifactService
-from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
-from google.adk.models.lite_llm import LiteLlm
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai import types
 from prompt_builder import (
     get_text_prompt,
     ROLE_DESCRIPTION,
@@ -69,15 +68,29 @@ class RestaurantAgent:
         if use_ui
         else None
     )
-    self._agent = self._build_agent(use_ui)
-    self._user_id = "remote_agent"
-    self._runner = Runner(
-        app_name=self._agent.name,
-        agent=self._agent,
-        artifact_service=InMemoryArtifactService(),
-        session_service=InMemorySessionService(),
-        memory_service=InMemoryMemoryService(),
+    
+    self.api_key = os.environ.get("OPENAI_API_KEY")
+    self.base_api_url = os.environ.get("OPENAI_BASE_URL")
+    self.model_name = os.environ.get("LLM_MODEL_NAME", "gpt-4o")
+    
+    self.client = AsyncOpenAI(
+        api_key=self.api_key,
+        base_url=self.base_api_url,
     )
+    
+    self.instruction = (
+        self._schema_manager.generate_system_prompt(
+            role_description=ROLE_DESCRIPTION,
+            ui_description=UI_DESCRIPTION,
+            include_schema=True,
+            include_examples=True,
+            validate_examples=True,
+        )
+        if use_ui
+        else get_text_prompt()
+    )
+    
+    self._sessions = {} # Simple in-memory session management for now
 
   def get_agent_card(self) -> AgentCard:
     capabilities = AgentCapabilities(
@@ -113,47 +126,41 @@ class RestaurantAgent:
   def get_processing_message(self) -> str:
     return "Finding restaurants that match your criteria..."
 
-  def _build_agent(self, use_ui: bool) -> LlmAgent:
-    """Builds the LLM agent for the restaurant agent."""
-    LITELLM_MODEL = os.getenv("LITELLM_MODEL", "gemini/gemini-2.5-flash")
-
-    instruction = (
-        self._schema_manager.generate_system_prompt(
-            role_description=ROLE_DESCRIPTION,
-            ui_description=UI_DESCRIPTION,
-            include_schema=True,
-            include_examples=True,
-            validate_examples=True,
-        )
-        if use_ui
-        else get_text_prompt()
-    )
-
-    return LlmAgent(
-        model=LiteLlm(model=LITELLM_MODEL),
-        name="restaurant_agent",
-        description="An agent that finds restaurants and helps book tables.",
-        instruction=instruction,
-        tools=[get_restaurants],
-    )
+  def _get_tools(self) -> list[dict[str, Any]]:
+      return [
+          {
+              "type": "function",
+              "function": {
+                  "name": "get_restaurants",
+                  "description": "Call this tool to get a list of restaurants based on user criteria (cuisine, location, etc.).",
+                  "parameters": {
+                      "type": "object",
+                      "properties": {
+                          "cuisine": {
+                              "type": "string",
+                              "description": "The type of cuisine to search for (e.g., Italian, Chinese)."
+                          },
+                          "location": {
+                              "type": "string",
+                              "description": "The location to search in (e.g., San Francisco, New York)."
+                          },
+                          "query": {
+                              "type": "string",
+                              "description": "A general search query for the restaurant."
+                          }
+                      },
+                      "required": ["query"]
+                  }
+              }
+          }
+      ]
 
   async def stream(self, query, session_id) -> AsyncIterable[dict[str, Any]]:
-    session_state = {"base_url": self.base_url}
-
-    session = await self._runner.session_service.get_session(
-        app_name=self._agent.name,
-        user_id=self._user_id,
-        session_id=session_id,
-    )
-    if session is None:
-      session = await self._runner.session_service.create_session(
-          app_name=self._agent.name,
-          user_id=self._user_id,
-          state=session_state,
-          session_id=session_id,
-      )
-    elif "base_url" not in session.state:
-      session.state["base_url"] = self.base_url
+    if session_id not in self._sessions:
+        self._sessions[session_id] = []
+    
+    messages = self._sessions[session_id]
+    messages.append({"role": "user", "content": query})
 
     # --- Begin: UI Validation and Retry Logic ---
     max_retries = 1  # Total 2 attempts
@@ -161,8 +168,8 @@ class RestaurantAgent:
     current_query_text = query
 
     # Ensure schema was loaded
-    selected_catalog = self._schema_manager.get_selected_catalog()
-    if self.use_ui and not selected_catalog.catalog_schema:
+    selected_catalog = self._schema_manager.get_selected_catalog() if self._schema_manager else None
+    if self.use_ui and (not selected_catalog or not selected_catalog.catalog_schema):
       logger.error(
           "--- RestaurantAgent.stream: A2UI_SCHEMA is not loaded. "
           "Cannot perform UI validation. ---"
@@ -189,30 +196,59 @@ class RestaurantAgent:
           f"for session {session_id} ---"
       )
 
-      current_message = types.Content(
-          role="user", parts=[types.Part.from_text(text=current_query_text)]
-      )
       final_response_content = None
+      
+      yield {
+          "is_task_complete": False,
+          "updates": self.get_processing_message(),
+      }
 
-      async for event in self._runner.run_async(
-          user_id=self._user_id,
-          session_id=session.id,
-          new_message=current_message,
-      ):
-        logger.info(f"Event from runner: {event}")
-        if event.is_final_response():
-          if event.content and event.content.parts and event.content.parts[0].text:
-            final_response_content = "\n".join(
-                [p.text for p in event.content.parts if p.text]
-            )
-          break  # Got the final response, stop consuming events
-        else:
-          logger.info(f"Intermediate event: {event}")
-          # Yield intermediate updates on every attempt
-          yield {
-              "is_task_complete": False,
-              "updates": self.get_processing_message(),
-          }
+      try:
+          response = await self.client.chat.completions.create(
+              model=self.model_name,
+              messages=[{"role": "system", "content": self.instruction}] + messages,
+              tools=self._get_tools(),
+              tool_choice="auto",
+          )
+          
+          message = response.choices[0].message
+          
+          if message.tool_calls:
+              for tool_call in message.tool_calls:
+                  if tool_call.function.name == "get_restaurants":
+                      args = json.loads(tool_call.function.arguments)
+                      # Mock ToolContext for the tool
+                      class MockToolContext:
+                          def __init__(self, base_url):
+                              self.state = {"base_url": base_url}
+                      
+                      tool_result = get_restaurants(
+                          query=args.get("query"),
+                          cuisine=args.get("cuisine"),
+                          location=args.get("location"),
+                          tool_context=MockToolContext(self.base_url)
+                      )
+                      
+                      messages.append(message)
+                      messages.append({
+                          "role": "tool",
+                          "tool_call_id": tool_call.id,
+                          "name": "get_restaurants",
+                          "content": tool_result
+                      })
+                      
+                      # Call again with tool results
+                      response = await self.client.chat.completions.create(
+                          model=self.model_name,
+                          messages=[{"role": "system", "content": self.instruction}] + messages,
+                      )
+                      final_response_content = response.choices[0].message.content
+          else:
+              final_response_content = message.content
+
+      except Exception as e:
+          logger.error(f"Error calling OpenAI: {e}")
+          final_response_content = f"Error: {e}"
 
       if final_response_content is None:
         logger.warning(
@@ -220,17 +256,12 @@ class RestaurantAgent:
             f" runner (Attempt {attempt}). ---"
         )
         if attempt <= max_retries:
-          current_query_text = (
-              "I received no response. Please try again."
-              f"Please retry the original request: '{query}'"
-          )
+          messages.append({"role": "user", "content": "I received no response. Please try again."})
           continue  # Go to next retry
         else:
-          # Retries exhausted on no-response
           final_response_content = (
               "I'm sorry, I encountered an error and couldn't process your request."
           )
-          # Fall through to send this as a text-only error
 
       is_valid = False
       error_message = ""
@@ -248,20 +279,7 @@ class RestaurantAgent:
               continue
 
             parsed_json_data = part.a2ui_json
-
-            # --- Validation Steps ---
-            # Check if it validates against the A2UI_SCHEMA
-            # This will raise jsonschema.exceptions.ValidationError if it fails
-            logger.info(
-                "--- RestaurantAgent.stream: Validating against A2UI_SCHEMA... ---"
-            )
             selected_catalog.validator.validate(parsed_json_data)
-            # --- End Validation Steps ---
-
-            logger.info(
-                "--- RestaurantAgent.stream: UI JSON successfully parsed AND validated"
-                f" against schema. Validation OK (Attempt {attempt}). ---"
-            )
             is_valid = True
 
         except (
@@ -273,19 +291,13 @@ class RestaurantAgent:
               f"--- RestaurantAgent.stream: A2UI validation failed: {e} (Attempt"
               f" {attempt}) ---"
           )
-          logger.warning(
-              f"--- Failed response content: {final_response_content[:500]}... ---"
-          )
           error_message = f"Validation failed: {e}."
 
       else:  # Not using UI, so text is always "valid"
         is_valid = True
 
       if is_valid:
-        logger.info(
-            "--- RestaurantAgent.stream: Response is valid. Sending final response"
-            f" (Attempt {attempt}). ---"
-        )
+        messages.append({"role": "assistant", "content": final_response_content})
         final_parts = parse_response_to_parts(
             final_response_content, fallback_text="OK."
         )
@@ -294,29 +306,18 @@ class RestaurantAgent:
             "is_task_complete": True,
             "parts": final_parts,
         }
-        return  # We're done, exit the generator
-
-      # --- If we're here, it means validation failed ---
+        return
 
       if attempt <= max_retries:
-        logger.warning(
-            f"--- RestaurantAgent.stream: Retrying... ({attempt}/{max_retries + 1}) ---"
-        )
-        # Prepare the query for the retry
-        current_query_text = (
+        retry_msg = (
             f"Your previous response was invalid. {error_message} You MUST generate a"
             " valid response that strictly follows the A2UI JSON SCHEMA. The response"
             " MUST be a JSON list of A2UI messages. Ensure each JSON part is wrapped in"
             f" '{A2UI_OPEN_TAG}' and '{A2UI_CLOSE_TAG}' tags. Please retry the"
-            f" original request: '{query}'"
+            f" original request."
         )
-        # Loop continues...
+        messages.append({"role": "user", "content": retry_msg})
 
-    # --- If we're here, it means we've exhausted retries ---
-    logger.error(
-        "--- RestaurantAgent.stream: Max retries exhausted. Sending text-only"
-        " error. ---"
-    )
     yield {
         "is_task_complete": True,
         "parts": [

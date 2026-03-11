@@ -247,6 +247,25 @@ class SendA2uiToClientToolset(base_toolset.BaseToolset):
           ),
       )
 
+    def _get_openai_declaration(self) -> dict[str, Any]:
+      return {
+          "type": "function",
+          "function": {
+              "name": self.name,
+              "description": self.description,
+              "parameters": {
+                  "type": "object",
+                  "properties": {
+                      self.A2UI_JSON_ARG_NAME: {
+                          "type": "string",
+                          "description": "valid A2UI JSON Schema to send to the client.",
+                      },
+                  },
+                  "required": [self.A2UI_JSON_ARG_NAME],
+              },
+          },
+      }
+
     async def _resolve_a2ui_examples(self, ctx: ReadonlyContext) -> str:
       """The resolved self.a2ui_examples field to construct instruction for this agent.
 
